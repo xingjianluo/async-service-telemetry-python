@@ -7,13 +7,13 @@ import re
 import pytest
 
 from app.telemetry.context import (
+    TraceContext,
     bind_context,
     get_context,
     new_trace_id,
     parse_inbound,
     run_propagated,
     try_get_context,
-    TraceContext,
 )
 
 

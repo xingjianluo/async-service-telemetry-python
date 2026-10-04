@@ -45,7 +45,7 @@ async def test_concurrent_mixed_requests_no_crosstalk(client, caplog):
 
     results = await asyncio.gather(*(one(t, p) for t, p in cases))
     assert len(results) == 200
-    print(f"[e2e] 200 并发混合请求 判定:全部响应携带各自 trace_id，无串扰")
+    print("[e2e] 200 并发混合请求 判定:全部响应携带各自 trace_id，无串扰")
 
 
 async def test_metrics_counted_exactly_once(client):
@@ -111,6 +111,45 @@ async def test_unknown_routes_merge_into_single_bucket(client):
     # 300 条不同路径只产生一个维度
     assert MetricsRegistry.UNMATCHED_ROUTE in snap
     print("[e2e] 300 条不同 404 路径 判定:归并 __unmatched__ 单一维度")
+
+
+async def test_concurrent_mixed_errors_timeouts_sampling_windows_reconcile(client):
+    """并发混合：成功/异常/超时 x 采样/不采样。
+
+    证明：窗口聚合与累计指标逐路由对账一致（不重不丢），
+    采样开关不影响计数，错误分类齐全。
+    """
+    plan = [("/", 30), ("/boom", 20), ("/upstream/timeout", 15),
+            ("/upstream/unavailable", 10)]
+
+    async def one(i: int, path: str) -> None:
+        r = await client.get(path, headers={
+            "x-request-id": f"stress-{i:04d}-{'c' * 16}",
+            "x-trace-sampled": "1" if i % 2 else "0",
+        })
+        assert r.headers["x-request-id"] == f"stress-{i:04d}-{'c' * 16}"
+
+    tasks = []
+    idx = 0
+    for path, n in plan:
+        for _ in range(n):
+            tasks.append(one(idx, path))
+            idx += 1
+    await asyncio.gather(*tasks)
+
+    metrics = client.app.state.metrics.snapshot()
+    windows = client.app.state.windows
+    for tpl, n in plan:
+        cum = metrics[tpl]
+        win = windows.snapshot(tpl)
+        assert cum.total == n, f"{tpl} 累计 {cum.total} != {n}"
+        assert win.total == cum.total, f"{tpl} 窗口 {win.total} != 累计 {cum.total}"
+        assert win.success == cum.success
+        assert win.client_errors == cum.client_errors
+        assert win.server_errors == cum.server_errors
+        assert win.quantiles[0.5] is not None
+        print(f"[e2e] {tpl} 判定:窗口==累计 total={cum.total} "
+              f"(5xx={cum.server_errors})，采样混合不影响计数")
 
 
 async def test_request_logs_carry_trace_id_and_verdict(client, caplog):

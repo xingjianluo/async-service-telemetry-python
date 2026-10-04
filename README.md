@@ -10,8 +10,11 @@
 app/
   service.py              # 应用组装：路由、探针、指标注册、中间件接线
   telemetry/
-    context.py            # 追踪上下文（contextvars）
-    metrics.py            # 指标注册表（基数受控）
+    context.py            # 追踪上下文（contextvars，含冻结的采样决定）
+    metrics.py            # 指标注册表（基数受控，累计值）
+    windows.py            # 滑动时间窗口聚合（p50/p95/p99）
+    sampling.py           # 采样决策与传播
+    snapshot.py           # 对外遥测快照（脱敏、限流、就绪门控）
     errors.py             # 异常归一化（安全分类）
     health.py             # liveness/readiness 判定
     middleware.py         # 入站遥测中间件（纯 ASGI）
@@ -62,7 +65,81 @@ tests/                    # 单测与并发端到端测试
 
 测试用 500 条高频未注册路径与 300 条不同 404 路径验证了维度不膨胀。
 
-## 3. 健康判定语义
+## 3. 滑动时间窗口
+
+在累计指标之外，`SlidingWindowMetrics` 提供每个路由**最近一段窗口**的聚合
+（默认窗口 300s、bucket 10s，共 30 个 bucket）：
+
+- **唯一归属**：每笔请求在完成时记录一次，按完成时间戳落入且仅落入一个
+  bucket（`index = floor(ts / bucket_seconds)`）。窗口前滚时，在途并发请求
+  的归属由完成时刻唯一确定，不会被两个窗口重复计入、也不会漏计；
+- **滚动裁剪**：过期 bucket 被裁剪，只影响窗口视图；累计指标独立维护，
+  二者可对账——窗口覆盖全部历史时，窗口聚合与累计值逐项相等
+  （`test_window_reconciles_with_cumulative`、
+  `test_concurrent_mixed_errors_timeouts_sampling_windows_reconcile`）；
+- **窗口内容**：`total / success / client_errors / server_errors`
+  （与累计同口径、互斥）+ 延迟分位数 `p50 / p95 / p99`
+  （窗口内原始样本线性插值，`rank = q*(n-1)`，无样本时为 `null`）；
+- **维度一致**：窗口复用中间件归并后的 canonical 路由键，不引入新维度，
+  基数约束与累计指标完全相同。
+
+## 4. 对外遥测快照 `GET /telemetry/snapshot`
+
+供外部编排/告警系统轮询的**只读**入口，一次返回窗口聚合与累计对照：
+
+```json
+{
+  "status": "up",
+  "window": {"window_seconds": 300.0, "bucket_seconds": 10.0},
+  "routes": {
+    "/items/{item_id}": {
+      "window":     {"total": 12, "success": 10, "client_errors": 1,
+                     "server_errors": 1,
+                     "quantiles": {"0.5": 0.01, "0.95": 0.4, "0.99": 0.5},
+                     "window_start": 1791074800.0, "window_end": 1791075100.0},
+      "cumulative": {"total": 128, "success": 120, "...": "..."}
+    }
+  },
+  "limits": {"route_count": 9}
+}
+```
+
+**脱敏边界**：
+
+- 路由键全部是 canonical 模板（注册模板 / `__other__` / `__unmatched__`），
+  不含具体 URL 与参数；
+- 不输出任何异常内部细节、依赖地址、健康检查名等依赖标识，
+  健康部分只输出整体 `status`；
+- 内部关联信息（`trace_id`、路由数、限流事件）只写服务端日志，
+  可凭请求头 `X-Request-Id` 在日志中定位。
+
+**容量保护**：
+
+- 维度上限沿用 `MetricsRegistry` 的 `max_routes`，超限走既有归并策略，
+  快照不会扩张维度；
+- 令牌桶限流（默认 5 req/s、突发 10），超限返回 **429**
+  `{"error": {"kind": "rate_limited"}}`，拒绝是即时的，不会拖垮服务。
+
+**就绪门控**：readiness 为 **down** 时返回 503**
+`{"error": {"kind": "not_ready"}}`，不返回看似正常的数据；
+**degraded** 仍返回 200 并在 `status` 字段如实标注，编排侧可据此门控。
+
+## 5. 追踪采样
+
+- **入口唯一决定**：中间件解析入站头 `X-Trace-Sampled: 1|0`
+  （也接受 `true/false`），合法则遵从；缺失或非法时**确定性降级**为服务
+  配置的默认值（`default_sampled`，默认 `true`）——同一部署内行为确定，
+  不会时有时无。判定依据（`inbound` / `default`）记入请求日志；
+- **冻结传播**：决定存入 frozen 的 `TraceContext.sampled`，链路中途不可
+  变更，不会出现半采样半不采样。下游调用用
+  `propagation_headers(ctx)` 显式携带 `X-Request-Id` + `X-Trace-Sampled`；
+  后台任务经 `bind_context_run` 继承同一快照（见 `POST /work`，
+  响应可对比 `sampled` 与 `background_sampled`）；
+- **与指标解耦**：采样只影响追踪详细度，指标计数与窗口聚合对所有请求
+  照常恰好记录一次，开关变化不会造成重复计数或窗口错乱；
+- 所有响应回写 `X-Trace-Sampled` 头，便于客户端与下游核对决定。
+
+## 6. 健康判定语义
 
 | 端点 | 语义 |
 | --- | --- |
@@ -92,7 +169,7 @@ tests/                    # 单测与并发端到端测试
 错误日志记录 `trace_id + kind + 内部细节`，可凭响应中的 `trace_id`
 在日志中定位完整链路。
 
-## 4. 演示路由
+## 7. 演示路由
 
 - `GET /`、`GET /items/{item_id}`：正常路径，回显 trace_id；
 - `POST /work`：追踪上下文传播到线程池后台任务；
@@ -101,7 +178,7 @@ tests/                    # 单测与并发端到端测试
 - `POST /debug/deps/{name}?state=up|down|slow`：切换 primary（关键）/
   cache（非关键）探针状态，用于演示就绪判定。
 
-## 5. 本地验证
+## 8. 本地验证
 
 ```bash
 uv sync
@@ -118,12 +195,30 @@ curl -i http://127.0.0.1:8000/upstream/timeout
 curl http://127.0.0.1:8000/health/live
 curl -X POST 'http://127.0.0.1:8000/debug/deps/cache?state=down'
 curl http://127.0.0.1:8000/health/ready   # degraded
+
+# 采样：显式关闭 / 缺省走默认
+curl -i -H 'X-Trace-Sampled: 0' http://127.0.0.1:8000/
+curl -i -X POST -H 'X-Trace-Sampled: 0' http://127.0.0.1:8000/work  # 后台任务继承
+
+# 对外快照：窗口 + 累计对照
+curl http://127.0.0.1:8000/telemetry/snapshot | jq
+# 未就绪时门控
+curl -X POST 'http://127.0.0.1:8000/debug/deps/primary?state=down'
+curl -i http://127.0.0.1:8000/telemetry/snapshot   # 503 not_ready
+# 高频轮询触发限流
+for i in $(seq 1 20); do curl -s -o /dev/null -w '%{http_code}\n' \
+  http://127.0.0.1:8000/telemetry/snapshot; done   # 后续出现 429
 ```
 
 测试覆盖重点：
 
 - 200 个并发混合请求（成功 + 三类失败交错）下追踪标识不串扰、不丢失；
 - 并发压测后指标 total 与请求数精确相等，成功/失败互斥不重复计数；
+- 窗口滚动时请求恰好归属一个 bucket（不重不丢），窗口聚合与累计逐路由对账一致；
+- 并发混合（异常 + 超时 + 采样/不采样各半）下窗口与累计仍一致，采样不影响计数；
+- 采样头合法遵从、非法/缺失确定性降级，决定随后台任务传播且上下文冻结不可篡改；
+- 快照脱敏（无异常细节、无依赖标识）、维度上限归并、令牌桶限流 429、
+  未就绪 503 门控；
 - 504/503/500 及对应 kind 可区分，响应体无内部异常细节；
 - 关键依赖 down、非关键依赖 degraded、探针超时 down 三类就绪判定；
 - 高频/未知路径归并到固定桶，指标维度有上界。

@@ -39,7 +39,7 @@ class ProbeResult:
     detail: str | None = None  # 仅入日志的内部信息
 
     @classmethod
-    def ok(cls) -> "ProbeResult":
+    def ok(cls) -> ProbeResult:
         return cls(state=HealthState.UP, reason=REASON_OK)
 
 
@@ -72,7 +72,7 @@ class HealthChecker:
         probe, _ = self._probes[name]
         try:
             return await asyncio.wait_for(probe(), timeout=self._probe_timeout)
-        except (asyncio.TimeoutError, TimeoutError):
+        except TimeoutError:
             logger.warning("health probe timeout", extra={"probe": name})
             return ProbeResult(
                 state=HealthState.DOWN,

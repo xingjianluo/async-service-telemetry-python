@@ -15,6 +15,13 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
+from .sampling import (
+    DECISION_DEFAULT,
+    SAMPLED_HEADER,
+    decide_sampling,
+    format_sampled_header,
+)
+
 TRACE_HEADER = "x-request-id"
 TRACE_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{8,128}$")
 
@@ -24,10 +31,16 @@ SOURCE_GENERATED = "generated"
 
 @dataclass(frozen=True, slots=True)
 class TraceContext:
-    """单次请求的追踪上下文。"""
+    """单次请求的追踪上下文。
+
+    sampled 在入口唯一决定并冻结（frozen），链路中途不可变更；
+    下游调用与后台任务通过传播继承同一决定。
+    """
 
     trace_id: str
     source: str
+    sampled: bool = True
+    sampled_source: str = DECISION_DEFAULT
 
 
 _current: contextvars.ContextVar[TraceContext | None] = contextvars.ContextVar(
@@ -44,11 +57,23 @@ def is_valid_trace_id(value: str | None) -> bool:
     return isinstance(value, str) and bool(TRACE_ID_PATTERN.fullmatch(value))
 
 
-def parse_inbound(raw: str | None) -> TraceContext:
-    """解析入站标识；缺失或非法时补全为 generated 上下文。"""
+def parse_inbound(raw: str | None, raw_sampled: str | None = None,
+                  default_sampled: bool = True) -> TraceContext:
+    """解析入站标识与采样决定；缺失或非法时确定性补全/降级。"""
+    sampled, sampled_source = decide_sampling(raw_sampled, default=default_sampled)
     if is_valid_trace_id(raw):
-        return TraceContext(trace_id=raw, source=SOURCE_INBOUND)
-    return TraceContext(trace_id=new_trace_id(), source=SOURCE_GENERATED)
+        return TraceContext(trace_id=raw, source=SOURCE_INBOUND,
+                            sampled=sampled, sampled_source=sampled_source)
+    return TraceContext(trace_id=new_trace_id(), source=SOURCE_GENERATED,
+                        sampled=sampled, sampled_source=sampled_source)
+
+
+def propagation_headers(ctx: TraceContext) -> dict[str, str]:
+    """生成向下游传播的头：追踪标识 + 冻结的采样决定。"""
+    return {
+        TRACE_HEADER: ctx.trace_id,
+        SAMPLED_HEADER: format_sampled_header(ctx.sampled),
+    }
 
 
 def get_context() -> TraceContext:

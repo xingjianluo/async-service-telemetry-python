@@ -1,10 +1,14 @@
 """入站遥测中间件（纯 ASGI）。
 
 职责（每个请求恰好一次）：
-1. 解析/补全追踪标识并绑定上下文（contextvars，任务级隔离）；
-2. 统一记录指标：正常响应与异常路径都只在 finally 中记录一次；
+1. 解析/补全追踪标识、做出采样决定并绑定上下文（contextvars，任务级隔离）；
+2. 统一记录指标：正常响应与异常路径都只在 finally 中记录一次，
+   累计指标与滑动窗口在同一点位记录，保证对账一致；
 3. 异常归一化：对外返回安全分类 + trace_id，内部细节仅入日志；
-4. 响应头回写 x-request-id，便于客户端关联。
+4. 响应头回写 x-request-id 与 x-trace-sampled，便于客户端关联。
+
+采样只影响追踪详细度，不影响指标计数；窗口按请求完成时间落桶，
+在途请求归属确定，不重不丢。
 
 路由维度由注入的 route_resolver 解析（starlette 不写 scope["route"]）。
 """
@@ -20,6 +24,8 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from .context import bind_context, parse_inbound
 from .errors import normalize_error
 from .metrics import MetricsRegistry
+from .sampling import SAMPLED_BYTES
+from .windows import SlidingWindowMetrics
 
 logger = logging.getLogger("telemetry.request")
 
@@ -34,10 +40,14 @@ class TelemetryMiddleware:
         app: ASGIApp,
         metrics: MetricsRegistry,
         route_resolver: RouteResolver,
+        windows: SlidingWindowMetrics | None = None,
+        default_sampled: bool = True,
     ) -> None:
         self.app = app
         self._metrics = metrics
         self._route_resolver = route_resolver
+        self._windows = windows
+        self._default_sampled = default_sampled
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -45,7 +55,8 @@ class TelemetryMiddleware:
             return
 
         raw_id = _extract_header(scope, _TRACE_HEADER_BYTES)
-        ctx = parse_inbound(raw_id)
+        raw_sampled = _extract_header(scope, SAMPLED_BYTES)
+        ctx = parse_inbound(raw_id, raw_sampled, default_sampled=self._default_sampled)
         start = time.perf_counter()
         status_code = 500  # 异常且未发响应时的兜底
         response_started = False
@@ -57,12 +68,13 @@ class TelemetryMiddleware:
                 status_code = message["status"]
                 headers = message.setdefault("headers", [])
                 headers.append((_TRACE_HEADER_BYTES, ctx.trace_id.encode()))
+                headers.append((SAMPLED_BYTES, b"1" if ctx.sampled else b"0"))
             await send(message)
 
         with bind_context(ctx):
             try:
                 await self.app(scope, receive, send_wrapper)
-            except Exception as exc:  # noqa: BLE001 - 统一归一化
+            except Exception as exc:
                 err = normalize_error(exc)
                 status_code = err.public_status
                 logger.error(
@@ -82,11 +94,14 @@ class TelemetryMiddleware:
                 duration = time.perf_counter() - start
                 route = self._route_resolver(scope)
                 canonical = self._metrics.record(route, status_code, duration)
+                if self._windows is not None:
+                    # 与累计指标同一点位、按完成时间落桶：恰好一次
+                    self._windows.record(canonical, status_code, duration)
                 logger.info(
                     "request done trace_id=%s source=%s route=%s canonical=%s "
-                    "status=%d duration=%.4fs",
+                    "status=%d duration=%.4fs sampled=%s sampled_source=%s",
                     ctx.trace_id, ctx.source, route, canonical,
-                    status_code, duration,
+                    status_code, duration, ctx.sampled, ctx.sampled_source,
                 )
 
 

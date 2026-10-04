@@ -4,12 +4,12 @@ from __future__ import annotations
 import asyncio
 
 from app.telemetry.health import (
+    REASON_ERROR,
+    REASON_OK,
+    REASON_TIMEOUT,
     HealthChecker,
     HealthState,
     ProbeResult,
-    REASON_OK,
-    REASON_TIMEOUT,
-    REASON_ERROR,
 )
 
 
@@ -84,6 +84,7 @@ async def test_readiness_timeout_is_down():
 async def test_app_readiness_endpoint_states():
     """通过 debug 接口切换依赖状态，验证端到端三种判定。"""
     import httpx
+
     from app.service import create_app
 
     app = create_app()

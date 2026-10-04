@@ -24,10 +24,15 @@ SOURCE_GENERATED = "generated"
 
 @dataclass(frozen=True, slots=True)
 class TraceContext:
-    """单次请求的追踪上下文。"""
+    """单次请求的追踪上下文。
+
+    sampled 在入站时一次性决定并随上下文传播（下游/后台任务），
+    整条链路恒定不变。
+    """
 
     trace_id: str
     source: str
+    sampled: bool = True
 
 
 _current: contextvars.ContextVar[TraceContext | None] = contextvars.ContextVar(

@@ -127,3 +127,97 @@ curl http://127.0.0.1:8000/health/ready   # degraded
 - 504/503/500 及对应 kind 可区分，响应体无内部异常细节；
 - 关键依赖 down、非关键依赖 degraded、探针超时 down 三类就绪判定；
 - 高频/未知路径归并到固定桶，指标维度有上界。
+
+## 6. 滑动时间窗口指标
+
+在累计指标之外，`WindowedMetrics`（`app/telemetry/window.py`）按路由维护
+**滑动窗口**聚合（默认窗口 300s、桶 10s，见 `service.py` 常量）：
+
+- **落桶唯一**：请求在完成时（中间件 `finally` 中唯一计数点）落入
+  *完成时刻*对应的桶。一笔请求只被记录一次，因此必落在且仅落在一个桶里——
+  正在并发处理的请求不会因为窗口滚动被两个窗口各算一次，也不会漏算；
+- **滚动语义**：窗口 = 最近 `window_seconds / bucket_seconds` 个桶，
+  旧桶随时间被复用重置。滚动只改变窗口聚合的可见范围，**不回写累计值**；
+  任意时刻 `窗口 total <= 累计 total`，未发生滚动时两者相等（有单测对账）；
+- **窗口内容**：`total / success / client_errors / server_errors`、
+  失败分类 `error_kinds`（归一化 kind 或 `http_4xx`/`http_5xx`，取值有界）、
+  由固定边界直方图近似的分位数 `p50 / p95 / p99`（内存有界）。
+
+## 7. 对外遥测快照（编排/告警拉取）
+
+`GET /telemetry/snapshot`：只读入口，供外部系统轮询。
+
+**字段**（全部脱敏）：
+
+| 字段 | 含义 |
+| --- | --- |
+| `snapshot_id` | 本次快照标识，已写入服务端日志，可凭它关联内部记录定位 |
+| `generated_at` / `window_seconds` | 生成时间与窗口长度 |
+| `status` | 就绪判定（`up` / `degraded`） |
+| `routes.<模板>.window` | 窗口聚合：计数、失败分类、p50/p95/p99 |
+| `routes.<模板>.cumulative` | 累计对照：计数与时延直方图/总和 |
+
+**脱敏边界**：只含路由模板、计数、稳定分类码与分位数；不含内部异常细节、
+依赖标识、连接信息（这些只出现在服务端日志，用 `snapshot_id`/`trace_id` 关联）。
+
+**容量保护**：
+
+- 维度上限沿用 `MetricsRegistry` 的注册/归并策略，快照不新增维度；
+- 令牌桶限流（默认 5/s、突发 10），超限返回 **429** + `Retry-After`；
+- 指标聚合结果短 TTL（1s）缓存，高频拉取不重复计算；
+  就绪判定每次新鲜执行，不被缓存。
+
+**就绪门控**：readiness 为 `down` 时返回 **503** `{"error": {"kind": "not_ready"}}`，
+绝不返回看似正常的陈旧数据；`degraded` 仍返回 200 并在 `status` 如实标注。
+
+## 8. 追踪采样
+
+- **决定时机**：入站时一次性做出，写入不可变 `TraceContext.sampled`，
+  整条链路（含下游调用、后台任务）恒定不变——采样开关变化只影响新请求，
+  不会把同一条链路拆成一半采样一半不采样；
+- **传播**：请求头 `X-Trace-Sampled: 1|0`（兼容 `true/false`）；
+  响应头回写该决定；`propagation_headers()` 生成下游调用头
+  （`POST /work` 演示了 trace_id + 采样决定传入线程池后台任务与下游头）；
+- **降级**：下游/上游不识别（缺头或非法值）时，按 `SamplingPolicy.default_rate`
+  对 trace_id 做**确定性哈希**判定——同一 trace_id 结果恒定，不会时有时无；
+- **与指标的关系**：采样只控制详细追踪（span 级日志）的开关，
+  **指标与窗口统计在任何采样决定下都恰好记录一次**；
+- 日志中 `sampling_basis`（`inbound_header` / `policy_default`）记录判定依据。
+
+## 9. 本地验证（新增能力）
+
+```bash
+uv run pytest                 # 含窗口/采样/快照单测与混合并发端到端测试
+
+uv run uvicorn main:app       # 启动服务
+
+# 采样：显式决定随响应头回写，并传入后台任务与下游头
+curl -i -H 'X-Request-Id: demo-trace-0001' -H 'X-Trace-Sampled: 0' \
+     -X POST http://127.0.0.1:8000/work
+# 缺头/非法头 → 确定性降级（同一 trace_id 多次请求结果一致）
+curl -i -H 'X-Request-Id: demo-trace-0001' http://127.0.0.1:8000/
+
+# 造一些流量后拉取对外快照（窗口 + 累计对照）
+curl http://127.0.0.1:8000/boom; curl http://127.0.0.1:8000/upstream/timeout
+curl http://127.0.0.1:8000/telemetry/snapshot | jq
+
+# 就绪门控：依赖 down 时快照返回 503
+curl -X POST 'http://127.0.0.1:8000/debug/deps/primary?state=down'
+curl -i http://127.0.0.1:8000/telemetry/snapshot   # 503 not_ready
+curl -X POST 'http://127.0.0.1:8000/debug/deps/primary?state=up'
+
+# 限流：快速连续拉取超过突发额度后出现 429 + Retry-After
+for i in $(seq 1 15); do curl -s -o /dev/null -w '%{http_code}\n' \
+     http://127.0.0.1:8000/telemetry/snapshot; done
+```
+
+新增测试覆盖重点：
+
+- 窗口：一笔请求只落一个桶、滚动不丢不重、在途请求按完成时刻落窗、
+  窗口与累计对账、失败分类与 p50/p95/p99；
+- 采样：显式决定优先、缺头/非法头确定性降级且不漂移、决定随响应头/
+  后台任务/下游头一致传播、采样混合下指标仍恰好计一次；
+- 快照：窗口+累计对照、脱敏（无内部细节/依赖标识）、限流 429、
+  TTL 缓存、未就绪 503 门控；
+- 端到端：并发混合（成功/异常/超时 × 采样开/关/缺头）下窗口合计
+  与累计合计精确相等。

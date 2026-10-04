@@ -45,7 +45,7 @@ async def test_concurrent_mixed_requests_no_crosstalk(client, caplog):
 
     results = await asyncio.gather(*(one(t, p) for t, p in cases))
     assert len(results) == 200
-    print(f"[e2e] 200 并发混合请求 判定:全部响应携带各自 trace_id，无串扰")
+    print("[e2e] 200 并发混合请求 判定:全部响应携带各自 trace_id，无串扰")
 
 
 async def test_metrics_counted_exactly_once(client):

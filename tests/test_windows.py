@@ -128,3 +128,100 @@ def test_snapshot_all_and_empty_route():
     assert empty.total == 0
     assert empty.window_end > empty.window_start
     print("[windows] 判定:snapshot_all 覆盖全部路由，未知路由返回空窗口")
+
+
+def test_window_failure_reasons_classified_and_summed():
+    """窗口内失败按原因归类，各原因之和恒等于窗口内失败总数。"""
+    clock = FakeClock()
+    win = SlidingWindowMetrics(window_seconds=60.0, bucket_seconds=10.0, clock=clock)
+    win.record("/a", 200, 0.1)
+    win.record("/a", 504, 0.1, reason="upstream_timeout")
+    win.record("/a", 503, 0.1, reason="upstream_unavailable")
+    win.record("/a", 500, 0.1, reason="internal")
+    win.record("/a", 500, 0.1)  # 未提供原因 -> 确定性推导 internal
+    win.record("/a", 404, 0.1)  # -> client_error
+
+    snap = win.snapshot("/a")
+    failures = snap.client_errors + snap.server_errors
+    assert sum(snap.failure_reasons.values()) == failures
+    assert snap.failure_reasons == {
+        "upstream_timeout": 1,
+        "upstream_unavailable": 1,
+        "internal": 2,
+        "client_error": 1,
+    }
+    print(f"[windows] 失败原因 判定:{snap.failure_reasons}，"
+          f"合计==窗口失败总数={failures}")
+
+
+def test_window_rolls_and_failure_reasons_expire():
+    """窗口前滚后，过期 bucket 的失败原因一并裁剪，不残留、不重复。"""
+    clock = FakeClock()
+    win = SlidingWindowMetrics(window_seconds=30.0, bucket_seconds=10.0, clock=clock)
+    win.record("/a", 504, 0.1, reason="upstream_timeout")  # bucket 100
+    clock.t = 1015.0  # bucket 101
+    win.record("/a", 500, 0.1, reason="internal")
+    snap = win.snapshot("/a")
+    assert snap.failure_reasons == {"upstream_timeout": 1, "internal": 1}
+
+    clock.t = 1031.0  # 窗口覆盖 101..103，bucket 100 过期
+    snap = win.snapshot("/a")
+    assert snap.failure_reasons == {"internal": 1}
+    assert sum(snap.failure_reasons.values()) == snap.server_errors
+    print("[windows] 原因滚动 判定:过期 bucket 的原因随窗口裁剪，无残留")
+
+
+def test_window_failure_reasons_reconcile_with_cumulative():
+    """窗口覆盖全部历史时，窗口与累计的 failure_reasons 逐项相等。"""
+    clock = FakeClock()
+    reg = MetricsRegistry(max_routes=4)
+    reg.register_route("/a")
+    win = SlidingWindowMetrics(window_seconds=3600.0, bucket_seconds=60.0, clock=clock)
+
+    plan = [
+        (200, None), (504, "upstream_timeout"), (503, "upstream_unavailable"),
+        (503, "dependency_degraded"), (500, "internal"), (500, None), (404, None),
+    ] * 20
+    for i, (status, reason) in enumerate(plan):
+        clock.t = 1000.0 + i * 0.5
+        reg.record("/a", status, 0.1, reason=reason)
+        win.record("/a", status, 0.1, reason=reason)
+
+    cum = reg.snapshot()["/a"]
+    snap = win.snapshot("/a")
+    assert snap.failure_reasons == cum.failure_reasons
+    assert sum(snap.failure_reasons.values()) == cum.client_errors + cum.server_errors
+    print(f"[windows] 原因对账 判定:窗口==累计 {snap.failure_reasons}")
+
+
+def test_concurrent_mixed_reasons_no_loss_no_dup():
+    """并发混合超时/不可用/内部异常/正常：窗口按原因对账，不重不丢。"""
+    clock = FakeClock()
+    win = SlidingWindowMetrics(window_seconds=300.0, bucket_seconds=10.0, clock=clock)
+    reasons = ["upstream_timeout", "upstream_unavailable", "internal", None]
+    statuses = {"upstream_timeout": 504, "upstream_unavailable": 503,
+                "internal": 500, None: 200}
+    n_threads, n_each = 8, 500
+
+    def worker(base: int) -> None:
+        for i in range(n_each):
+            reason = reasons[(base + i) % len(reasons)]
+            win.record("/a", statuses[reason], 0.01, reason=reason)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(n_threads)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+
+    snap = win.snapshot("/a")
+    assert snap.total == n_threads * n_each
+    expected_each = n_threads * n_each // len(reasons)
+    assert snap.failure_reasons == {
+        "upstream_timeout": expected_each,
+        "upstream_unavailable": expected_each,
+        "internal": expected_each,
+    }
+    assert sum(snap.failure_reasons.values()) == snap.server_errors
+    print(f"[windows] 并发混合原因 判定:{snap.failure_reasons}，"
+          f"total={snap.total} 不重不丢")

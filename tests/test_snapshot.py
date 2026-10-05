@@ -117,3 +117,65 @@ async def test_snapshot_log_carries_trace_id(client, caplog):
                          headers={"x-request-id": "snap-trace-001"})
     assert "snap-trace-001" in caplog.text
     print("[snapshot] 日志 判定:内部日志保留 trace_id 关联，对外不暴露")
+
+
+async def test_snapshot_exposes_failure_reasons_both_sides(client):
+    """快照在窗口与累计两侧都给出失败原因分布，且两侧对账一致。"""
+    await client.get("/")
+    await client.get("/upstream/timeout")
+    await client.get("/upstream/timeout")
+    await client.get("/upstream/unavailable")
+    await client.get("/boom")
+    r = await client.get("/telemetry/snapshot")
+    assert r.status_code == 200
+    routes = r.json()["routes"]
+
+    expectations = {
+        "/upstream/timeout": {"upstream_timeout": 2},
+        "/upstream/unavailable": {"upstream_unavailable": 1},
+        "/boom": {"internal": 1},
+    }
+    for route, reasons in expectations.items():
+        win = routes[route]["window"]
+        cum = routes[route]["cumulative"]
+        # 窗口与累计两侧都带 failure_reasons，且本用例内二者相等
+        assert win["failure_reasons"] == reasons
+        assert cum["failure_reasons"] == reasons
+        # 各原因之和 == 同侧失败总数
+        assert sum(win["failure_reasons"].values()) == (
+            win["client_errors"] + win["server_errors"]
+        )
+        assert sum(cum["failure_reasons"].values()) == (
+            cum["client_errors"] + cum["server_errors"]
+        )
+        print(f"[snapshot] {route} 判定:窗口/累计原因分布一致 {reasons}")
+    # 成功路由无失败原因
+    assert routes["/"]["cumulative"]["failure_reasons"] == {}
+    print("[snapshot] 判定:成功路由 failure_reasons 为空，不虚构原因")
+
+
+async def test_snapshot_failure_reasons_still_sanitized(client):
+    """失败原因是有界安全词汇，不携带异常细节与依赖标识。"""
+    await client.get("/boom")
+    await client.get("/upstream/unavailable")
+    await client.get("/upstream/degraded")
+    r = await client.get("/telemetry/snapshot")
+    assert r.status_code == 200
+    routes = r.json()["routes"]
+    allowed = {
+        "upstream_timeout", "upstream_unavailable", "dependency_degraded",
+        "validation", "internal", "client_error",
+    }
+    for route, sides in routes.items():
+        for side in ("window", "cumulative"):
+            data = sides[side]
+            if data is None:
+                continue
+            assert set(data["failure_reasons"]) <= allowed, (
+                f"{route}/{side} 出现词汇外原因: {data['failure_reasons']}"
+            )
+    text = r.text
+    leaked = ("secret internal detail", "10.0.0.1", "circuit half-open",
+              "RuntimeError", "UpstreamUnavailableError")
+    assert not any(s in text for s in leaked), f"泄露: {text}"
+    print("[snapshot] 原因脱敏 判定:原因限于有界词汇，无异常类名/细节/依赖标识")

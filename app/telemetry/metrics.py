@@ -7,6 +7,13 @@
 - server_errors：status_code >= 500。
 三者互斥且 total = 三者之和。
 
+失败原因（failure_reasons）：
+- 每次失败（status_code >= 400）恰好归入一个原因桶，各原因之和恒等于
+  client_errors + server_errors（失败总数），不重不漏；
+- 原因词汇有界：中间件在异常路径传入归一化分类（ErrorKind 值），
+  未提供时按状态码确定性推导（4xx -> client_error，5xx -> internal），
+  绝不出现无原因的失败，也不扩张维度基数。
+
 维度约束：
 - 只有通过 register_route() 显式注册的路由模板才拥有独立维度；
 - 已识别但未注册的模板统一归并到 __other__；
@@ -24,6 +31,20 @@ LATENCY_BOUNDS: tuple[float, ...] = (
 )
 INF = float("inf")
 
+# 失败原因词汇（有界）：异常路径由中间件传入 ErrorKind 值，
+# 未提供时按状态码确定性推导为下列两个兜底值之一
+REASON_CLIENT_ERROR = "client_error"
+REASON_INTERNAL = "internal"
+
+
+def derive_failure_reason(status_code: int) -> str | None:
+    """按状态码确定性推导失败原因；成功请求返回 None（无失败原因）。"""
+    if status_code < 400:
+        return None
+    if status_code < 500:
+        return REASON_CLIENT_ERROR
+    return REASON_INTERNAL
+
 
 @dataclass(slots=True)
 class RouteMetrics:
@@ -33,6 +54,7 @@ class RouteMetrics:
     success: int = 0
     client_errors: int = 0
     server_errors: int = 0
+    failure_reasons: dict[str, int] = field(default_factory=dict)
     latency_buckets: dict[float, int] = field(default_factory=dict)
     latency_sum_seconds: float = 0.0
     latency_count: int = 0
@@ -43,6 +65,7 @@ class RouteMetrics:
             "success": self.success,
             "client_errors": self.client_errors,
             "server_errors": self.server_errors,
+            "failure_reasons": dict(self.failure_reasons),
             "latency_buckets": dict(self.latency_buckets),
             "latency_sum_seconds": self.latency_sum_seconds,
             "latency_count": self.latency_count,
@@ -94,9 +117,21 @@ class MetricsRegistry:
             self._metrics[key] = m
         return m
 
-    def record(self, route: str | None, status_code: int, duration: float) -> str:
-        """记录一次请求的结果，成功/失败在此唯一计数。返回实际归并维度。"""
+    def record(
+        self,
+        route: str | None,
+        status_code: int,
+        duration: float,
+        reason: str | None = None,
+    ) -> str:
+        """记录一次请求的结果，成功/失败在此唯一计数。返回实际归并维度。
+
+        reason：失败原因（有界词汇，异常路径由中间件传入归一化分类）；
+        失败但未提供时按状态码确定性推导，成功请求忽略该参数。
+        """
         key = self.canonical_route(route)
+        if status_code >= 400 and reason is None:
+            reason = derive_failure_reason(status_code)
         with self._lock:
             m = self._ensure(key)
             m.total += 1
@@ -106,6 +141,8 @@ class MetricsRegistry:
                 m.client_errors += 1
             else:
                 m.server_errors += 1
+            if reason is not None and status_code >= 400:
+                m.failure_reasons[reason] = m.failure_reasons.get(reason, 0) + 1
             m.latency_buckets[_bucket_for(duration)] = (
                 m.latency_buckets.get(_bucket_for(duration), 0) + 1
             )
@@ -124,6 +161,7 @@ def _copy_metrics(m: RouteMetrics) -> RouteMetrics:
         success=m.success,
         client_errors=m.client_errors,
         server_errors=m.server_errors,
+        failure_reasons=dict(m.failure_reasons),
         latency_buckets=dict(m.latency_buckets),
         latency_sum_seconds=m.latency_sum_seconds,
         latency_count=m.latency_count,

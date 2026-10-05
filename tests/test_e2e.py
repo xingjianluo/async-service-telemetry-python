@@ -160,3 +160,78 @@ async def test_request_logs_carry_trace_id_and_verdict(client, caplog):
     assert "log-trace-0001" in text and "route=/" in text
     assert "log-trace-0002" in text and "kind=internal" in text
     print("[e2e] 日志 判定:包含 trace_id 与路由/分类依据")
+
+
+async def test_concurrent_mixed_reasons_reconcile_and_sampled_headers(client):
+    """并发混合：正常/超时/下游不可用/降级/内部异常 x 采样开与关。
+
+    断言：
+    1. 每条响应（含异常路径）的 x-trace-sampled 与入站决定一致；
+    2. 窗口与累计的 failure_reasons 逐路由、逐原因对账一致；
+    3. 各原因之和 == 失败总数，不重不丢。
+    """
+    plan = [
+        ("/", 30, None),
+        ("/upstream/timeout", 15, "upstream_timeout"),
+        ("/upstream/unavailable", 10, "upstream_unavailable"),
+        ("/upstream/degraded", 5, "dependency_degraded"),
+        ("/boom", 20, "internal"),
+    ]
+
+    async def one(i: int, path: str) -> None:
+        sampled = "1" if i % 2 else "0"
+        r = await client.get(path, headers={
+            "x-request-id": f"reason-{i:04d}-{'d' * 16}",
+            "x-trace-sampled": sampled,
+        })
+        # 成功与异常路径的采样标记都必须与入站决定一致
+        assert r.headers["x-trace-sampled"] == sampled, (
+            f"{path} 采样标记缺失或不一致: {dict(r.headers)}"
+        )
+
+    tasks = []
+    idx = 0
+    for path, n, _ in plan:
+        for _ in range(n):
+            tasks.append(one(idx, path))
+            idx += 1
+    await asyncio.gather(*tasks)
+
+    metrics = client.app.state.metrics.snapshot()
+    windows = client.app.state.windows
+    for tpl, n, reason in plan:
+        cum = metrics[tpl]
+        win = windows.snapshot(tpl)
+        assert cum.total == n
+        assert win.total == cum.total
+        # 按原因逐项对账：窗口 == 累计
+        assert win.failure_reasons == cum.failure_reasons, (
+            f"{tpl} 窗口 {win.failure_reasons} != 累计 {cum.failure_reasons}"
+        )
+        # 各原因之和 == 失败总数
+        failures = cum.client_errors + cum.server_errors
+        assert sum(cum.failure_reasons.values()) == failures
+        if reason is not None:
+            assert cum.failure_reasons == {reason: n}, (
+                f"{tpl} 原因归类错误: {cum.failure_reasons}"
+            )
+        print(f"[e2e] {tpl} 判定:窗口==累计 原因={cum.failure_reasons}，"
+              f"采样标记全路径一致")
+
+
+async def test_error_paths_echo_sampled_decision(client):
+    """异常路径（超时/不可用/降级/内部异常）与正常路径一样回写采样标记。"""
+    paths = ["/upstream/timeout", "/upstream/unavailable",
+             "/upstream/degraded", "/boom", "/"]
+    for sampled in ("1", "0"):
+        for path in paths:
+            r = await client.get(path, headers={"x-trace-sampled": sampled})
+            assert r.headers["x-trace-sampled"] == sampled, (
+                f"{path} sampled={sampled} 缺失或不一致"
+            )
+    # 缺失/非法头部在异常路径同样确定性降级为默认（default_sampled=True）
+    for headers in ({}, {"x-trace-sampled": "maybe"}):
+        for path in paths:
+            r = await client.get(path, headers=headers)
+            assert r.headers["x-trace-sampled"] == "1"
+    print("[e2e] 异常路径采样标记 判定:与入站决定一致，缺失/非法确定性降级")

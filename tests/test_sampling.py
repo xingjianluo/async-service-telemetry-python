@@ -137,3 +137,21 @@ async def test_request_log_carries_sampling_verdict(client, caplog):
     assert "sampled_source=inbound" in text
     assert "slog-00000002" in text and "sampled_source=default" in text
     print("[sampling] 日志 判定:包含 trace_id、采样值与判定依据来源")
+
+
+async def test_error_responses_carry_same_sampled_flag(client):
+    """异常路径（超时/不可用/内部异常）的采样标记与正常路径同一规则。"""
+    # 入站显式决定：成功与异常响应一致回写
+    for sampled in ("1", "0"):
+        for path in ("/", "/upstream/timeout", "/upstream/unavailable", "/boom"):
+            r = await client.get(path, headers={"x-trace-sampled": sampled})
+            assert r.headers["x-trace-sampled"] == sampled, (
+                f"{path} 异常路径采样标记缺失或不一致"
+            )
+    # 缺失/非法：异常路径同样确定性降级为默认，不时有时无
+    for path in ("/upstream/timeout", "/boom"):
+        r1 = await client.get(path)
+        r2 = await client.get(path, headers={"x-trace-sampled": "garbage"})
+        assert r1.headers["x-trace-sampled"] == "1"
+        assert r2.headers["x-trace-sampled"] == "1"
+    print("[sampling] 异常路径 判定:采样标记与正常路径一致，降级规则相同")

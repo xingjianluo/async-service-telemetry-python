@@ -48,8 +48,26 @@ tests/                    # 单测与并发端到端测试
 | --- | --- |
 | `total` | 该路由请求总数 |
 | `success` / `client_errors` / `server_errors` | 互斥三类（<400 / 4xx / 5xx），三者之和恒等于 `total` |
+| `failure_reasons` | 失败原因分布（见下），各原因之和恒等于 `client_errors + server_errors` |
 | `latency_buckets` | 时延直方图，桶边界固定：0.005…5.0 秒 + `+Inf` |
 | `latency_sum_seconds` / `latency_count` | 时延总和与样本数，可求均值 |
+
+**失败原因（`failure_reasons`）**：每次失败恰好归入一个原因桶，不重不漏。
+原因词汇有界：
+
+| 原因 | 来源 |
+| --- | --- |
+| `upstream_timeout` | 下游超时（`asyncio.TimeoutError` 等） |
+| `upstream_unavailable` | 下游不可用（连接失败等） |
+| `dependency_degraded` | 依赖部分降级 |
+| `validation` | 请求校验失败 |
+| `internal` | 服务内部异常（含未分类 5xx 的确定性兜底） |
+| `client_error` | 未分类 4xx 的确定性兜底 |
+
+异常路径由中间件把归一化分类（`ErrorKind`）作为原因传入；非异常路径的
+失败（如 404）按状态码**确定性推导**（4xx → `client_error`，5xx →
+`internal`），因此任何失败都有且仅有一个原因，绝不出现无原因失败，
+也不扩张维度基数。
 
 **唯一计数点**：中间件 `finally` 块中恰好调用一次 `record()`，成功与异常
 路径都经过它，因此不重不漏。
@@ -78,7 +96,10 @@ tests/                    # 单测与并发端到端测试
   （`test_window_reconciles_with_cumulative`、
   `test_concurrent_mixed_errors_timeouts_sampling_windows_reconcile`）；
 - **窗口内容**：`total / success / client_errors / server_errors`
-  （与累计同口径、互斥）+ 延迟分位数 `p50 / p95 / p99`
+  （与累计同口径、互斥）+ `failure_reasons`（与累计同一词汇、同一口径，
+  窗口内各原因之和恒等于窗口内 `client_errors + server_errors`，
+  过期 bucket 的原因随窗口前滚一并裁剪，不残留、不重复）
+  + 延迟分位数 `p50 / p95 / p99`
   （窗口内原始样本线性插值，`rank = q*(n-1)`，无样本时为 `null`）；
 - **维度一致**：窗口复用中间件归并后的 canonical 路由键，不引入新维度，
   基数约束与累计指标完全相同。
@@ -95,14 +116,25 @@ tests/                    # 单测与并发端到端测试
     "/items/{item_id}": {
       "window":     {"total": 12, "success": 10, "client_errors": 1,
                      "server_errors": 1,
+                     "failure_reasons": {"upstream_timeout": 1, "client_error": 1},
                      "quantiles": {"0.5": 0.01, "0.95": 0.4, "0.99": 0.5},
                      "window_start": 1791074800.0, "window_end": 1791075100.0},
-      "cumulative": {"total": 128, "success": 120, "...": "..."}
+      "cumulative": {"total": 128, "success": 120, "client_errors": 3,
+                     "server_errors": 5,
+                     "failure_reasons": {"upstream_timeout": 2,
+                                         "upstream_unavailable": 2,
+                                         "internal": 1, "client_error": 3},
+                     "...": "..."}
     }
   },
   "limits": {"route_count": 9}
 }
 ```
+
+**失败原因对账口径**：窗口与累计两侧都输出 `failure_reasons`，词汇相同
+（见第 2 节）。同一侧内 `sum(failure_reasons) == client_errors +
+server_errors` 恒成立；窗口覆盖全部历史时，两侧 `failure_reasons`
+逐项相等。告警侧可直接按原因分别设阈值，并与累计口径逐项对照。
 
 **脱敏边界**：
 
@@ -137,7 +169,10 @@ tests/                    # 单测与并发端到端测试
   响应可对比 `sampled` 与 `background_sampled`）；
 - **与指标解耦**：采样只影响追踪详细度，指标计数与窗口聚合对所有请求
   照常恰好记录一次，开关变化不会造成重复计数或窗口错乱；
-- 所有响应回写 `X-Trace-Sampled` 头，便于客户端与下游核对决定。
+- **全路径回写**：所有响应都回写 `X-Trace-Sampled` 头——正常响应与异常
+  响应（含下游超时 504、下游不可用 503、内部异常 500）走同一规则，
+  与入站决定保持一致；入站头缺失或非法时同样按确定性降级结果回写，
+  不会时有时无。下游与后台任务因此总能拿到完整的采样决定。
 
 ## 6. 健康判定语义
 
@@ -199,9 +234,16 @@ curl http://127.0.0.1:8000/health/ready   # degraded
 # 采样：显式关闭 / 缺省走默认
 curl -i -H 'X-Trace-Sampled: 0' http://127.0.0.1:8000/
 curl -i -X POST -H 'X-Trace-Sampled: 0' http://127.0.0.1:8000/work  # 后台任务继承
+# 异常路径同样回写采样标记（与入站决定一致）
+curl -i -H 'X-Trace-Sampled: 0' http://127.0.0.1:8000/boom            # 响应头 x-trace-sampled: 0
+curl -i -H 'X-Trace-Sampled: 0' http://127.0.0.1:8000/upstream/timeout
 
-# 对外快照：窗口 + 累计对照
-curl http://127.0.0.1:8000/telemetry/snapshot | jq
+# 对外快照：窗口 + 累计对照（两侧均含 failure_reasons 失败原因分布）
+curl http://127.0.0.1:8000/boom >/dev/null
+curl http://127.0.0.1:8000/upstream/unavailable >/dev/null
+curl -s http://127.0.0.1:8000/telemetry/snapshot | \
+  jq '.routes["/boom"].cumulative.failure_reasons,
+      .routes["/upstream/unavailable"].window.failure_reasons'
 # 未就绪时门控
 curl -X POST 'http://127.0.0.1:8000/debug/deps/primary?state=down'
 curl -i http://127.0.0.1:8000/telemetry/snapshot   # 503 not_ready
@@ -214,11 +256,18 @@ for i in $(seq 1 20); do curl -s -o /dev/null -w '%{http_code}\n' \
 
 - 200 个并发混合请求（成功 + 三类失败交错）下追踪标识不串扰、不丢失；
 - 并发压测后指标 total 与请求数精确相等，成功/失败互斥不重复计数；
-- 窗口滚动时请求恰好归属一个 bucket（不重不丢），窗口聚合与累计逐路由对账一致；
-- 并发混合（异常 + 超时 + 采样/不采样各半）下窗口与累计仍一致，采样不影响计数；
-- 采样头合法遵从、非法/缺失确定性降级，决定随后台任务传播且上下文冻结不可篡改；
-- 快照脱敏（无异常细节、无依赖标识）、维度上限归并、令牌桶限流 429、
-  未就绪 503 门控；
+- 失败按原因归类：各原因之和恒等于失败总数，异常路径取归一化分类、
+  其余按状态码确定性推导，归并维度（`__other__`/`__unmatched__）同样保留原因；
+- 窗口滚动时请求恰好归属一个 bucket（不重不丢），过期 bucket 的原因随窗口
+  一并裁剪；窗口聚合（含 `failure_reasons`）与累计逐路由、逐原因对账一致；
+- 并发混合（正常/超时/下游不可用/降级/内部异常 x 采样开与关交错）下
+  窗口与累计按原因对账一致，采样不影响计数；
+- 采样头合法遵从、非法/缺失确定性降级；正常与异常（504/503/500）响应
+  都回写 `X-Trace-Sampled` 且与入站决定一致；决定随后台任务传播且
+  上下文冻结不可篡改；
+- 快照在窗口与累计两侧输出 `failure_reasons`，原因限于有界安全词汇，
+  脱敏（无异常细节、无异常类名、无依赖标识）、维度上限归并、
+  令牌桶限流 429、未就绪 503 门控；
 - 504/503/500 及对应 kind 可区分，响应体无内部异常细节；
 - 关键依赖 down、非关键依赖 degraded、探针超时 down 三类就绪判定；
 - 高频/未知路径归并到固定桶，指标维度有上界。

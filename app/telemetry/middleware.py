@@ -3,9 +3,11 @@
 职责（每个请求恰好一次）：
 1. 解析/补全追踪标识、做出采样决定并绑定上下文（contextvars，任务级隔离）；
 2. 统一记录指标：正常响应与异常路径都只在 finally 中记录一次，
-   累计指标与滑动窗口在同一点位记录，保证对账一致；
+   累计指标与滑动窗口在同一点位记录、共享同一份失败原因判定，
+   保证窗口与累计按原因逐项对账一致；
 3. 异常归一化：对外返回安全分类 + trace_id，内部细节仅入日志；
-4. 响应头回写 x-request-id 与 x-trace-sampled，便于客户端关联。
+4. 响应头回写 x-request-id 与 x-trace-sampled（含异常路径的错误响应），
+   采样标记与入站决定保持一致，不会时有时无。
 
 采样只影响追踪详细度，不影响指标计数；窗口按请求完成时间落桶，
 在途请求归属确定，不重不丢。
@@ -21,9 +23,9 @@ from collections.abc import Callable
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from .context import bind_context, parse_inbound
+from .context import TraceContext, bind_context, parse_inbound
 from .errors import normalize_error
-from .metrics import MetricsRegistry
+from .metrics import MetricsRegistry, classify_failure_reason
 from .sampling import SAMPLED_BYTES
 from .windows import SlidingWindowMetrics
 
@@ -60,6 +62,7 @@ class TelemetryMiddleware:
         start = time.perf_counter()
         status_code = 500  # 异常且未发响应时的兜底
         response_started = False
+        error_kind: str | None = None  # 异常路径的归一化分类（ErrorKind.value）
 
         async def send_wrapper(message: Message) -> None:
             nonlocal status_code, response_started
@@ -77,13 +80,14 @@ class TelemetryMiddleware:
             except Exception as exc:
                 err = normalize_error(exc)
                 status_code = err.public_status
+                error_kind = err.kind.value
                 logger.error(
                     "request failed trace_id=%s kind=%s detail=%s",
                     ctx.trace_id, err.kind.value, err.internal_detail,
                 )
                 if response_started:
                     raise  # 响应已流出，无法改写，只能上抛
-                await _send_error_json(send, status_code, ctx.trace_id, {
+                await _send_error_json(send, status_code, ctx, {
                     "error": {
                         "kind": err.kind.value,
                         "message": err.public_message,
@@ -93,15 +97,21 @@ class TelemetryMiddleware:
             finally:
                 duration = time.perf_counter() - start
                 route = self._route_resolver(scope)
-                canonical = self._metrics.record(route, status_code, duration)
+                # 同一份失败原因判定喂给累计与窗口：按原因对账一致的唯一来源
+                reason = classify_failure_reason(status_code, error_kind)
+                canonical = self._metrics.record(route, status_code, duration,
+                                                 reason=reason)
                 if self._windows is not None:
                     # 与累计指标同一点位、按完成时间落桶：恰好一次
-                    self._windows.record(canonical, status_code, duration)
+                    self._windows.record(canonical, status_code, duration,
+                                         reason=reason)
                 logger.info(
                     "request done trace_id=%s source=%s route=%s canonical=%s "
-                    "status=%d duration=%.4fs sampled=%s sampled_source=%s",
+                    "status=%d duration=%.4fs sampled=%s sampled_source=%s "
+                    "failure_reason=%s",
                     ctx.trace_id, ctx.source, route, canonical,
                     status_code, duration, ctx.sampled, ctx.sampled_source,
+                    reason,
                 )
 
 
@@ -112,14 +122,16 @@ def _extract_header(scope: Scope, name: bytes) -> str | None:
     return None
 
 
-async def _send_error_json(send: Send, status: int, trace_id: str, payload: dict) -> None:
+async def _send_error_json(send: Send, status: int, ctx: TraceContext, payload: dict) -> None:
+    """异常路径的错误响应：与正常响应一样回写追踪标识与采样标记。"""
     body = json.dumps(payload).encode()
     await send({
         "type": "http.response.start",
         "status": status,
         "headers": [
             (b"content-type", b"application/json"),
-            (_TRACE_HEADER_BYTES, trace_id.encode()),
+            (_TRACE_HEADER_BYTES, ctx.trace_id.encode()),
+            (SAMPLED_BYTES, b"1" if ctx.sampled else b"0"),
         ],
     })
     await send({"type": "http.response.body", "body": body})

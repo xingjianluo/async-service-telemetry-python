@@ -9,7 +9,10 @@
   累计指标（MetricsRegistry）独立维护，二者可对账：
   窗口覆盖全部历史时，窗口聚合 == 累计值；
 - 延迟分位数（p50/p95/p99）由窗口内留存的原始样本计算，
-  采用线性插值（rank = q * (n-1)），结果确定。
+  采用线性插值（rank = q * (n-1)），结果确定；
+- 失败原因（failure_reasons）与累计指标同口径：每次失败恰好落入
+  一个原因桶，随所属 bucket 一起滚动过期，窗口内各原因之和恒等于
+  client_errors + server_errors，窗口覆盖全部历史时与累计逐项对账一致。
 """
 from __future__ import annotations
 
@@ -18,6 +21,8 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+
+from .metrics import classify_failure_reason
 
 # 窗口内延迟分位数
 QUANTILES: tuple[float, ...] = (0.5, 0.95, 0.99)
@@ -29,6 +34,7 @@ class _Bucket:
     success: int = 0
     client_errors: int = 0
     server_errors: int = 0
+    failure_reasons: dict[str, int] = field(default_factory=dict)
     latencies: list[float] = field(default_factory=list)
 
 
@@ -43,6 +49,7 @@ class WindowSnapshot:
     success: int = 0
     client_errors: int = 0
     server_errors: int = 0
+    failure_reasons: dict[str, int] = field(default_factory=dict)
     quantiles: dict[float, float | None] = field(default_factory=dict)
 
     def to_dict(self) -> dict:
@@ -54,6 +61,7 @@ class WindowSnapshot:
             "success": self.success,
             "client_errors": self.client_errors,
             "server_errors": self.server_errors,
+            "failure_reasons": dict(self.failure_reasons),
             "quantiles": dict(self.quantiles),
         }
 
@@ -127,11 +135,18 @@ class SlidingWindowMetrics:
         status_code: int,
         duration: float,
         ts: float | None = None,
+        reason: str | None = None,
     ) -> None:
-        """记录一次完成的请求；按 ts（默认当前时钟）落入唯一 bucket。"""
+        """记录一次完成的请求；按 ts（默认当前时钟）落入唯一 bucket。
+
+        reason 与 MetricsRegistry.record 同口径：失败且未提供时按状态码
+        确定性推导，每次失败恰好计入一个原因桶，随 bucket 一起过期。
+        """
         if ts is None:
             ts = self._clock()
         idx = self._bucket_index(ts)
+        if status_code >= 400:
+            reason = classify_failure_reason(status_code, reason)
         with self._lock:
             self._prune_locked(self._bucket_index(self._clock()))
             buckets = self._routes.setdefault(route, {})
@@ -146,6 +161,8 @@ class SlidingWindowMetrics:
                 b.client_errors += 1
             else:
                 b.server_errors += 1
+            if reason is not None:
+                b.failure_reasons[reason] = b.failure_reasons.get(reason, 0) + 1
             b.latencies.append(duration)
 
     def _window_bounds(self, now: float) -> tuple[float, float, int]:
@@ -184,6 +201,7 @@ class SlidingWindowMetrics:
     ) -> WindowSnapshot:
         oldest = now_index - self._num_buckets + 1
         total = success = client_errors = server_errors = 0
+        failure_reasons: dict[str, int] = {}
         latencies: list[float] = []
         for idx, b in buckets.items():
             if idx < oldest or idx > now_index:
@@ -192,6 +210,8 @@ class SlidingWindowMetrics:
             success += b.success
             client_errors += b.client_errors
             server_errors += b.server_errors
+            for reason, count in b.failure_reasons.items():
+                failure_reasons[reason] = failure_reasons.get(reason, 0) + count
             latencies.extend(b.latencies)
         latencies.sort()
         quantiles = {q: _quantile(latencies, q) for q in QUANTILES}
@@ -203,5 +223,6 @@ class SlidingWindowMetrics:
             success=success,
             client_errors=client_errors,
             server_errors=server_errors,
+            failure_reasons=failure_reasons,
             quantiles=quantiles,
         )
